@@ -220,10 +220,6 @@ EOD
 				. '/1.1/statuses/user_timeline.json?user_id='
 				. $this->getRestId($this->getInput('u'))
 				. '&tweet_mode=extended';
-				return self::API_URI
-				. '/2/timeline/profile/'
-				. $this->getRestId($this->getInput('u'))
-				. '.json?tweet_mode=extended';
 			}
 		case 'By list':
 			return self::API_URI
@@ -240,12 +236,54 @@ EOD
 	}
 
 	public function collectData(){
-		$html = '';
-		$page = $this->getURI();
-		$result = $this->getApiContents($this->getApiURI());
-		$data = json_decode($result);
+		// $data will contain an array of all found tweets
+		$data = null;
+		// Contains user data (when in by username context)
+		$user = null;
+		// Array of all found tweets
+		$tweets = array();
 
-		if(!$data) {
+		switch($this->queriedContext) {
+		case 'By username':
+			$user = $this->makeApiCall('/1.1/users/show.json', array('screen_name' => $this->getInput('u')));
+			if (!$user) {
+				returnServerError('Requested username can\'t be found.');
+			}
+
+			$params = array(
+				'user_id'	 => $user->id,
+				'tweet_mode' => 'extended'
+			);
+
+			$tweets = $this->makeApiCall('/1.1/statuses/user_timeline.json', $params);
+			break;
+
+		case 'By keyword or hashtag':
+			$params					= array(
+				'q'					=> urlencode($this->getInput('q')),
+				'tweet_mode'		=> 'extended',
+				'tweet_search_mode' => 'live',
+			);
+
+			$data = $this->makeApiCall('/1.1/search/tweets.json', $params)->statuses;
+
+			foreach ($data as $tweet) {
+				if (isset($tweet->retweeted_status) && substr($tweet->full_text, 0, 4) === 'RT @') {
+					continue;
+				}
+
+				$tweets[] = $tweet;
+			}
+
+			break;
+
+		default:
+			// Contexts which aren't ported to V1.1
+			$result = $this->getApiContents($this->getApiURI());
+			$data = json_decode($result);
+		}
+
+		if(!$tweets) {
 			switch($this->queriedContext) {
 			case 'By keyword or hashtag':
 				returnServerError('No results for this query.');
@@ -255,11 +293,6 @@ EOD
 				returnServerError('Requested username or list can\'t be found');
 			}
 		}
-
-		// $datadump = explode("\n", json_encode($data, JSON_PRETTY_PRINT));
-		// foreach ($datadump as $h) {
-		//	   error_log($h);
-		// }
 
 		$hidePictures = $this->getInput('nopic');
 
@@ -275,14 +308,14 @@ EOD
 		// }, array());
 
 		$hidePinned = $this->getInput('nopinned');
-		// if ($hidePinned) {
-		//	$pinnedTweetId = null;
-		//	if (isset($data->timeline->instructions[1]) && isset($data->timeline->instructions[1]->pinEntry)) {
-		//		$pinnedTweetId = $data->timeline->instructions[1]->pinEntry->entry->content->item->content->tweet->id;
-		//	}
-		// }
-
-		$tweets = array();
+		if ($hidePinned) {
+			$pinnedTweetId = null;
+			if ($user) {
+				if ($user->pinned_tweet_ids_str) {
+					$pinnedTweetId = $user->pinned_tweet_ids_str;
+				}
+			}
+		}
 
 		// Extract tweets from timeline property when in username mode
 		// This fixes number of issues:
@@ -310,7 +343,7 @@ EOD
 		//	}
 		// }
 
-		foreach($data as $tweet) {
+		foreach($tweets as $tweet) {
 
 			/* Debug::log('>>> ' . json_encode($tweet)); */
 			// Skip spurious retweets
@@ -324,9 +357,16 @@ EOD
 			// }
 
 			// // Skip pinned tweet
-			// if ($hidePinned && $tweet->id_str === $pinnedTweetId) {
-			//	continue;
-			// }
+			if ($hidePinned && $tweet->id_str === $pinnedTweetId) {
+				continue;
+			}
+
+			switch($this->queriedContext) {
+				case 'By username':
+					if ($this->getInput('norep') && isset($tweet->in_reply_to_status_id))
+						continue 2;
+					break;
+			}
 
 			$item = array();
 			// extract username and sanitize
@@ -647,19 +687,40 @@ EOD;
 		return $searchResult->data->user_by_screen_name->list->id_str;
 	}
 
-	private function getUserInformation($userId, $apiData) {
-		foreach($apiData->users as $user) {
-			if($user->id_str == $userId) {
-				return $user;
-			}
-		}
-	}
+	// private function getUserInformation($userId, $apiData) {
+	// 	foreach($apiData->users as $user) {
+	// 		if($user->id_str == $userId) {
+	// 			return $user;
+	// 		}
+	// 	}
+	// }
 
-	private function getTweet($tweetId, $apiData) {
-		if (property_exists($apiData->tweets, $tweetId)) {
-			return $apiData->tweets->$tweetId;
-		} else {
-			return null;
-		}
+	// private function getTweet($tweetId, $apiData) {
+	// 	if (property_exists($apiData->tweets, $tweetId)) {
+	// 		return $apiData->tweets->$tweetId;
+	// 	} else {
+	// 		return null;
+	// 	}
+	// }
+
+	/**
+	 * Tries to make an API call to twitter.
+	 * @param $api string API entry point
+	 * @param $params array additional URI parmaeters
+	 * @return object json data
+	 */
+	private function makeApiCall($api, $params) {
+		$apiKeys = $this->getApiKey();
+		$headers = array(
+			'authorization: Bearer ' . $apiKeys[0],
+			'x-guest-token: ' . $apiKeys[1],
+		);
+
+		$uri = self::API_URI . $api . '?' . http_build_query($params);
+
+		$result = getContents($uri, $headers);
+		$data = json_decode($result);
+
+		return $data;
 	}
 }
