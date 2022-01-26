@@ -118,6 +118,10 @@ EOD
 		)
 	);
 
+	private $apiKey	    = null;
+	private $guestToken = null;
+	private $authHeader = array();
+
 	public function detectParameters($url){
 		$params = array();
 
@@ -236,13 +240,17 @@ EOD
 	}
 
 	public function collectData(){
-		// $data will contain an array of all found tweets
+		// $data will contain an array of all found tweets (unfiltered)
 		$data = null;
 		// Contains user data (when in by username context)
 		$user = null;
 		// Array of all found tweets
 		$tweets = array();
 
+		// Get authentication information
+		$this->getApiKey();
+
+		// Try to get all tweets
 		switch($this->queriedContext) {
 		case 'By username':
 			$user = $this->makeApiCall('/1.1/users/show.json', array('screen_name' => $this->getInput('u')));
@@ -255,26 +263,17 @@ EOD
 				'tweet_mode' => 'extended'
 			);
 
-			$tweets = $this->makeApiCall('/1.1/statuses/user_timeline.json', $params);
+			$data = $this->makeApiCall('/1.1/statuses/user_timeline.json', $params);
 			break;
 
 		case 'By keyword or hashtag':
-			$params					= array(
+			$params = array(
 				'q'					=> urlencode($this->getInput('q')),
 				'tweet_mode'		=> 'extended',
 				'tweet_search_mode' => 'live',
 			);
 
 			$data = $this->makeApiCall('/1.1/search/tweets.json', $params)->statuses;
-
-			foreach ($data as $tweet) {
-				if (isset($tweet->retweeted_status) && substr($tweet->full_text, 0, 4) === 'RT @') {
-					continue;
-				}
-
-				$tweets[] = $tweet;
-			}
-
 			break;
 
 		default:
@@ -283,7 +282,7 @@ EOD
 			$data = json_decode($result);
 		}
 
-		if(!$tweets) {
+		if(!$data) {
 			switch($this->queriedContext) {
 			case 'By keyword or hashtag':
 				returnServerError('No results for this query.');
@@ -292,6 +291,19 @@ EOD
 			case 'By list':
 				returnServerError('Requested username or list can\'t be found');
 			}
+		}
+
+		// Filter out unwanted tweets
+		foreach ($data as $tweet) {
+			// Filter out retweets to remove possible duplicates of original tweet
+			switch($this->queriedContext) {
+			case 'By keyword or hashtag':
+				if (isset($tweet->retweeted_status) && substr($tweet->full_text, 0, 4) === 'RT @') {
+					continue 2;
+				}
+				break;
+			}
+			$tweets[] = $tweet;
 		}
 
 		$hidePictures = $this->getInput('nopic');
@@ -343,12 +355,13 @@ EOD
 		//	}
 		// }
 
+		// Create output array with all required elements for each tweet
 		foreach($tweets as $tweet) {
 
 			/* Debug::log('>>> ' . json_encode($tweet)); */
 			// Skip spurious retweets
 			// if (isset($tweet->retweeted_status) && substr($tweet->text, 0, 4) === 'RT @') {
-			// 	continue;
+			//	continue;
 			// }
 
 			// // Skip promoted tweets
@@ -381,24 +394,30 @@ EOD
 			// $item['avatar'] = $user_info->profile_image_url_https;
 
 			if (isset($tweet->retweeted_status)) {
+				// Tweet is a Retweet, so set fields based on original tweet
 				$item['username'] = $tweet->retweeted_status->user->screen_name;
 				$item['fullname'] = $tweet->retweeted_status->user->name;
 				$item['avatar'] = $tweet->retweeted_status->user->profile_image_url_https;
 				$item['author'] = 'RT: ' . $item['fullname'] . ' (@' . $item['username'] . ')';
+				$item['timestamp'] = $tweet->retweeted_status->created_at;
+				$item['id'] = $tweet->retweeted_status->id_str;
+
 			} else {
 				$item['username'] = $tweet->user->screen_name;
 				$item['fullname'] = $tweet->user->name;
 				$item['avatar'] = $tweet->user->profile_image_url_https;
 				$item['author'] = $item['fullname'] . ' (@' . $item['username'] . ')';
+				$item['timestamp'] = $tweet->created_at;
+				$item['id'] = $tweet->id_str;
 			}
+
+			$item['uri'] = self::URI . $item['username'] . '/status/' . $item['id'];
+
 			// if (null !== $this->getInput('u') && strtolower($item['username']) != strtolower($this->getInput('u'))) {
-			// 	$item['author'] .= ' RT: @' . $this->getInput('u');
+			//	$item['author'] .= ' RT: @' . $this->getInput('u');
 			// }
 
-			$item['id'] = $tweet->id_str;
-			$item['uri'] = self::URI . $item['username'] . '/status/' . $item['id'];
 			// extract tweet timestamp
-			$item['timestamp'] = $tweet->created_at;
 
 			// Convert plain text URLs into HTML hyperlinks
 			$fulltext = $tweet->full_text;
@@ -555,7 +574,7 @@ EOD;
 
 	//The aim of this function is to get an API key and a guest token
 	//This function takes 2 requests, and therefore is cached
-	private function getApiKey() {
+	private function getApiKey($forceNew = 0) {
 
 		$cacheFac = new CacheFactory();
 		$cacheFac->setWorkingDir(PATH_LIB_CACHES);
@@ -580,7 +599,7 @@ EOD;
 		$data = $cache->loadData();
 
 		$apiKey = null;
-		if($data === null || (time() - $refresh) > self::GUEST_TOKEN_EXPIRY) {
+		if($forceNew || $data === null || (time() - $refresh) > self::GUEST_TOKEN_EXPIRY) {
 			$twitterPage = getContents('https://twitter.com');
 
 			$jsLink = false;
@@ -617,7 +636,7 @@ EOD;
 		$guestTokenUses = $gt_cache->loadData();
 
 		$guestToken = null;
-		if($guestTokenUses === null || !is_array($guestTokenUses) || count($guestTokenUses) != 2
+		if($forceNew || $guestTokenUses === null || !is_array($guestTokenUses) || count($guestTokenUses) != 2
 		|| $guestTokenUses[0] <= 0 || (time() - $refresh) > self::GUEST_TOKEN_EXPIRY) {
 			$guestToken = $this->getGuestToken($apiKey);
 			if ($guestToken === null) {
@@ -636,8 +655,15 @@ EOD;
 			$guestToken = $guestTokenUses[1];
 		}
 
-		return array($apiKey, $guestToken);
+		$this->apiKey	  = $apiKey;
+		$this->guestToken = $guestToken;
 
+		$this->authHeaders = array(
+			'authorization: Bearer ' . $apiKey,
+			'x-guest-token: ' . $guestToken,
+		);
+
+		return array($apiKey, $guestToken);
 	}
 
 	// Get a guest token. This is different to an API key,
@@ -660,11 +686,11 @@ EOD;
 	}
 
 	private function getApiContents($uri) {
-		$apiKeys = $this->getApiKey();
-		$headers = array('authorization: Bearer ' . $apiKeys[0],
-				 'x-guest-token: ' . $apiKeys[1],
-			   );
-		return getContents($uri, $headers);
+		// $apiKeys = $this->getApiKey();
+		// $headers = array('authorization: Bearer ' . $apiKeys[0],
+		// 		 'x-guest-token: ' . $apiKeys[1],
+		// 	   );
+		return getContents($uri, $this->authHeaders);
 	}
 
 	private function getRestId($username) {
@@ -710,15 +736,27 @@ EOD;
 	 * @return object json data
 	 */
 	private function makeApiCall($api, $params) {
-		$apiKeys = $this->getApiKey();
-		$headers = array(
-			'authorization: Bearer ' . $apiKeys[0],
-			'x-guest-token: ' . $apiKeys[1],
-		);
-
 		$uri = self::API_URI . $api . '?' . http_build_query($params);
 
-		$result = getContents($uri, $headers);
+		$retries = 1;
+		$retry = 0;
+		do {
+			$retry = 0;
+			try {
+				$result = getContents($uri, $this->authHeaders);
+			} catch (Exception $e) {
+				$lastCode = $e->getCode();
+				if ($lastCode == 403) {
+					if ($retries) {
+						$retries--;
+						$retry = 1;
+						continue;
+					}
+				}
+				returnServerError('Failed to make api call: $api returns ' . $e->getCode());
+			}
+		} while ($retry);
+
 		$data = json_decode($result);
 
 		return $data;
